@@ -494,9 +494,23 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
                 trampoline_lock.wait(true, std::memory_order_acquire);
                 continue;
             }
+            // Android 16+ strictly enforces W^X: mmap(RWX) may succeed but
+            // with PROT_EXEC silently dropped, leaving the page RW-only.
+            // When CPU later branches into this page, SIGSEGV with
+            // "trying to execute non-executable memory".
+            //
+            // Fix: allocate RW, then flip to RX after the memcpy below.
+            // This also side-steps SELinux execmem denial (which applies
+            // to the combined W+X state, not sequential transitions).
             address = reinterpret_cast<uintptr_t>(mmap(nullptr, kPageSize,
-                                                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                                                       PROT_READ | PROT_WRITE,
                                                        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
+            if (address == reinterpret_cast<uintptr_t>(MAP_FAILED)) {
+                // Fallback to legacy RWX path for older Android
+                address = reinterpret_cast<uintptr_t>(mmap(nullptr, kPageSize,
+                                                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                                                           MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
+            }
             if (address == reinterpret_cast<uintptr_t>(MAP_FAILED)) {
                 PLOGE("mmap trampoline");
                 trampoline_lock.clear(std::memory_order_release);
@@ -519,6 +533,13 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
     std::memcpy(address_ptr, trampoline.data(), trampoline.size());
 
     *reinterpret_cast<art::ArtMethod **>(address_ptr + art_method_offset) = hook;
+
+    // Flip the page to R+X now that it's been written. This is the W->X
+    // transition Android 16 W^X requires us to make sequentially.
+    // The page covering `address` is the same for all trampolines sharing
+    // this slot; mprotect is a no-op once the page is already R+X.
+    uintptr_t page_base = address & ~kAddressMask;
+    mprotect(reinterpret_cast<void *>(page_base), kPageSize, PROT_READ | PROT_EXEC);
 
     __builtin___clear_cache(address_ptr, reinterpret_cast<char *>(address + trampoline.size()));
 
