@@ -530,15 +530,18 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
         break;
     }
     auto *address_ptr = reinterpret_cast<char *>(address);
+    // The arena page was mprotect'd to R+X at the end of a previous call for
+    // an earlier slot. Writing the new slot would SEGV_ACCERR unless we flip
+    // it back to R+W first. On A16 nezha with MDWE=0 both transitions are
+    // cheap; this is not conditional because R+W->R+W is also a no-op.
+    uintptr_t page_base = address & ~kAddressMask;
+    mprotect(reinterpret_cast<void *>(page_base), kPageSize, PROT_READ | PROT_WRITE);
+
     std::memcpy(address_ptr, trampoline.data(), trampoline.size());
 
     *reinterpret_cast<art::ArtMethod **>(address_ptr + art_method_offset) = hook;
 
-    // Flip the page to R+X now that it's been written. This is the W->X
-    // transition Android 16 W^X requires us to make sequentially.
-    // The page covering `address` is the same for all trampolines sharing
-    // this slot; mprotect is a no-op once the page is already R+X.
-    uintptr_t page_base = address & ~kAddressMask;
+    // Flip the page to R+X now that it's been written.
     mprotect(reinterpret_cast<void *>(page_base), kPageSize, PROT_READ | PROT_EXEC);
 
     __builtin___clear_cache(address_ptr, reinterpret_cast<char *>(address + trampoline.size()));
